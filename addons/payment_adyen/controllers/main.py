@@ -47,7 +47,7 @@ class AdyenController(http.Controller):
         :param float amount: The transaction amount
         :param int currency_id: The transaction currency, as a `res.currency` id
         :param int partner_id: The partner making the transaction, as a `res.partner` id
-        :return: The JSON-formatted content of the response
+        :return: The JSON-formatted content of the response and formatted amount
         :rtype: dict
         """
         provider_sudo = request.env['payment.provider'].sudo().browse(provider_id)
@@ -64,22 +64,33 @@ class AdyenController(http.Controller):
         # provide the lang string as is (after adapting the format) and let Adyen find the best fit.
         lang_code = (request.context.get('lang') or 'en-US').replace('_', '-')
         shopper_reference = partner_sudo and f'ODOO_PARTNER_{partner_sudo.id}'
+        amount = {
+            'value': converted_amount,
+            'currency': request.env['res.currency'].browse(currency_id).name,  # ISO 4217
+        }
+        partner_country_code = (
+            partner_sudo.country_id.code or provider_sudo.company_id.country_id.code or 'NL'
+        )
         data = {
             'merchantAccount': provider_sudo.adyen_merchant_account,
-            'amount': converted_amount,
-            'countryCode': partner_sudo.country_id.code or None,  # ISO 3166-1 alpha-2 (e.g.: 'BE')
+            'amount': amount,
+            'countryCode': partner_country_code,  # ISO 3166-1 alpha-2 (e.g.: 'BE')
             'shopperLocale': lang_code,  # IETF language tag (e.g.: 'fr-BE')
             'shopperReference': shopper_reference,
             'channel': 'Web',
         }
-        response_content = provider_sudo._adyen_make_request(
+        payment_methods_data = provider_sudo._adyen_make_request(
             url_field_name='adyen_checkout_api_url',
             endpoint='/paymentMethods',
             payload=data,
             method='POST'
         )
-        _logger.info("paymentMethods request response:\n%s", pprint.pformat(response_content))
-        return response_content
+        _logger.info("paymentMethods request response:\n%s", pprint.pformat(payment_methods_data))
+        return {
+            'payment_methods_data': payment_methods_data,
+            'amount_formatted': amount,
+            'country_code': partner_country_code
+        }
 
     @http.route('/payment/adyen/payments', type='json', auth='public')
     def adyen_payments(
@@ -102,7 +113,7 @@ class AdyenController(http.Controller):
         # Check that the transaction details have not been altered. This allows preventing users
         # from validating transactions by paying less than agreed upon.
         if not payment_utils.check_access_token(
-            access_token, reference, converted_amount, partner_id
+            access_token, reference, converted_amount, currency_id, partner_id
         ):
             raise ValidationError("Adyen: " + _("Received tampered payment request data."))
 
@@ -121,9 +132,9 @@ class AdyenController(http.Controller):
             'recurringProcessingModel': 'CardOnFile',  # Most susceptible to trigger a 3DS check
             'shopperIP': payment_utils.get_customer_ip_address(),
             'shopperInteraction': 'Ecommerce',
-            'shopperEmail': tx_sudo.partner_email,
+            'shopperEmail': tx_sudo.partner_email or "",
             'shopperName': adyen_utils.format_partner_name(tx_sudo.partner_name),
-            'telephoneNumber': tx_sudo.partner_phone,
+            'telephoneNumber': tx_sudo.partner_phone or "",
             'storePaymentMethod': tx_sudo.tokenize,  # True by default on Adyen side
             'additionalData': {
                 'allow3DS2': True
@@ -152,11 +163,15 @@ class AdyenController(http.Controller):
             data.update(captureDelayHours=0)
 
         # Make the payment request to Adyen
+        idempotency_key = payment_utils.generate_idempotency_key(
+            tx_sudo, scope='payment_request_controller'
+        )
         response_content = provider_sudo._adyen_make_request(
             url_field_name='adyen_checkout_api_url',
             endpoint='/payments',
             payload=data,
-            method='POST'
+            method='POST',
+            idempotency_key=idempotency_key,
         )
 
         # Handle the payment request response
@@ -331,20 +346,6 @@ class AdyenController(http.Controller):
         :return: The computed signature
         :rtype: str
         """
-        def _flatten_dict(_value, _path_base='', _separator='.'):
-            """ Recursively generate a flat representation of a dict.
-
-            :param Object _value: The value to flatten. A dict or an already flat value
-            :param str _path_base: They base path for keys of _value, including preceding separators
-            :param str _separator: The string to use as a separator in the key path
-            """
-            if isinstance(_value, dict):  # The inner value is a dict, flatten it
-                _path_base = _path_base if not _path_base else _path_base + _separator
-                for _key in _value:
-                    yield from _flatten_dict(_value[_key], _path_base + str(_key))
-            else:  # The inner value cannot be flattened, yield it
-                yield _path_base, _value
-
         def _to_escaped_string(_value):
             """ Escape payload values that are using illegal symbols and cast them to string.
 
@@ -362,14 +363,18 @@ class AdyenController(http.Controller):
             else:
                 return str(_value)
 
-        signature_keys = [
-            'pspReference', 'originalReference', 'merchantAccountCode', 'merchantReference',
-            'amount.value', 'amount.currency', 'eventCode', 'success'
+        # Read the signature values
+        amount = payload.get('amount') or {}
+        signature_values = [
+            payload.get('pspReference'),
+            payload.get('originalReference'),
+            payload.get('merchantAccountCode'),
+            payload.get('merchantReference'),
+            amount.get('value'),
+            amount.get('currency'),
+            payload.get('eventCode'),
+            payload.get('success'),
         ]
-        # Flatten the payload to allow accessing inner dicts naively
-        flattened_payload = {k: v for k, v in _flatten_dict(payload)}
-        # Build the list of signature values as per the list of required signature keys
-        signature_values = [flattened_payload.get(key) for key in signature_keys]
         # Escape values using forbidden symbols
         escaped_values = [_to_escaped_string(value) for value in signature_values]
         # Concatenate values together with ':' as delimiter

@@ -3,6 +3,7 @@
 import logging
 import pprint
 
+from werkzeug.exceptions import Forbidden
 from werkzeug.urls import url_encode, url_join
 
 from odoo import _, models
@@ -203,7 +204,8 @@ class PaymentTransaction(models.Model):
                 raise ValidationError("Razorpay: " + _("Received data with missing reference."))
             tx = self.search([('reference', '=', reference), ('provider_code', '=', 'razorpay')])
         else:  # 'refund'
-            reference = notification_data.get('notes', {}).get('reference')
+            notes = notification_data.get('notes')
+            reference = isinstance(notes, dict) and notes.get('reference')
             if reference:  # The refund was initiated from Odoo.
                 tx = self.search([('reference', '=', reference), ('provider_code', '=', 'razorpay')])
             else:  # The refund was initiated from Razorpay.
@@ -271,6 +273,10 @@ class PaymentTransaction(models.Model):
                 "Response of '/payments' request for transaction with reference %s:\n%s",
                 self.reference, pprint.pformat(entity_data)
             )
+        if self.reference != entity_data["description"]:
+            _logger.warning("Received payment data with incorrect reference")
+            raise Forbidden()
+
         entity_id = entity_data.get('id')
         if not entity_id:
             raise ValidationError("Razorpay: " + _("Received data with missing entity id."))

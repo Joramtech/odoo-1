@@ -37,7 +37,7 @@ class TestMassMailing(models.TransientModel):
         # Downside: Qweb syntax is only tested when there is atleast one record of the mailing's model
         if record:
             # Returns a proper error if there is a syntax error with Qweb
-            body = mailing._render_field('body_html', record.ids, post_process=True)[record.id]
+            body = mailing.with_context(preserve_comments=True)._render_field('body_html', record.ids, post_process=True)[record.id]
             preview = mailing._render_field('preview', record.ids, post_process=True)[record.id]
             full_body = mailing._prepend_preview(Markup(body), preview)
             subject = mailing._render_field('subject', record.ids)[record.id]
@@ -54,7 +54,7 @@ class TestMassMailing(models.TransientModel):
                 'reply_to': mailing.reply_to,
                 'email_to': valid_email,
                 'subject': subject,
-                'body_html': self.env['ir.qweb']._render('mass_mailing.mass_mailing_mail_layout', {'body': full_body}, minimal_qcontext=True),
+                'body_html': self.env['ir.qweb']._render('mass_mailing.mass_mailing_mail_layout', {'body': full_body}, minimal_qcontext=True, preserve_comments=True),
                 'is_notification': True,
                 'mailing_id': mailing.id,
                 'attachment_ids': [(4, attachment.id) for attachment in mailing.attachment_ids],
